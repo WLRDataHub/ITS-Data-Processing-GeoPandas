@@ -12,6 +12,7 @@ import logging
 import time
 import psutil
 import os
+import yaml
 
 import numpy as np
 import pandas as pd
@@ -206,7 +207,22 @@ def enrich_Timber_Nonspatial(tn_input_excel_path,
     }
     tn_df['ACTIVITY_DESCRIPTION'] = tn_df['ACTIVITY_DESCRIPTION'].replace(activity_mapping)
     tn_df['Crosswalk'] = tn_df['ACTIVITY_DESCRIPTION']
-    
+
+
+
+    def get_factors(val):
+        # find closest factor for sub-rectangle division
+        val = int(np.ceil(val))
+        # make even if odd
+        if val & 0x1:
+            val += 1
+        width = np.ceil(np.sqrt(val))
+        
+        while (val%width != 0):
+            width -= 1
+        length = val/width
+        return width, length
+        
     # Add coordinates based on activity description
     lat_mapping = {
         'Aspen/Meadow/Wet Area Restoration': 37.482646,
@@ -268,16 +284,25 @@ def enrich_Timber_Nonspatial(tn_input_excel_path,
         'Thinning (Mechanical)': -123.373398,
         
     }
-    
-    tn_df['LATITUDE'] = tn_df['ACTIVITY_DESCRIPTION'].map(lat_mapping)
-    tn_df['LONGITUDE'] = tn_df['ACTIVITY_DESCRIPTION'].map(lon_mapping)
 
-    #### NOT FINAL
-    # assign random lat lon within bbox if lat lon is None
+    # Revised grid geometery
     lat_min, lat_max = min(lat_mapping.values()), max(lat_mapping.values())
     lon_min, lon_max = min(lon_mapping.values()), max(lon_mapping.values())
-    tn_df.loc[tn_df.LATITUDE.isna(), 'LATITUDE'] = np.random.rand(sum(tn_df.LATITUDE.isna()))*(lat_max - lat_min) + lat_min
-    tn_df.loc[tn_df.LONGITUDE.isna(), 'LONGITUDE'] = np.random.rand(sum(tn_df.LONGITUDE.isna()))*(lon_min - lon_max) + lon_min
+
+    delta = int(np.ceil(np.sqrt(len(tn_df))))
+    lat_delta = (lat_max - lat_min)/delta
+    lon_delta = (lon_max - lon_min)/delta
+
+    coords = np.mgrid[lon_min:lon_max:lon_delta, lat_min:lat_max:lat_delta].T
+    coords = coords.reshape(coords.shape[0]*coords.shape[1], -1)
+
+    tn_df = tn_df.sort_values(by='ACTIVITY_DESCRIPTION')
+
+    tn_df.geometry = [Point(coords[i]) for i in range(len(tn_df))]
+
+    #tn_df['LATITUDE'] = tn_df['ACTIVITY_DESCRIPTION'].map(lat_mapping)
+    #tn_df['LONGITUDE'] = tn_df['ACTIVITY_DESCRIPTION'].map(lon_mapping)
+
 
 
     # Convert to GeoDataFrame
@@ -332,7 +357,35 @@ def enrich_Timber_Nonspatial(tn_input_excel_path,
     logger.info(f"   step 9/10 Assign Domains...")
     tn_enriched = assign_domains(tn_enriched)
 
+
+    # re-assign cluster based geometry after enrich
+    # requires ACTIVITY_CAT from enrichment
+    cat_len = len(tn_enriched.ACTIVITY_CAT.unique())
+    width, length = get_factors(cat_len)
+
+    bbox_dict = {}
+    lat_delta = (lat_max - lat_min)/width
+    lon_delta = (lon_max - lon_min)/length
+    OFFSET = 0.015
+    lat_cur = lat_min
+    lon_cur = lon_min
+    for c in tn_enriched.ACTIVITY_CAT.unique():
+        if lat_cur+lat_delta >= lat_max:
+            lat_cur = lat_min
+            lon_cur = lon_cur + lon_delta
+        bbox_dict[c] = {"lat_min": lat_cur,
+                    "lat_max": lat_cur + lat_delta,
+                    "lon_min": lon_cur,
+                    "lon_max": lon_cur + lon_delta}
+        lat_cur += lat_delta
+
+    def get_pts(row):
+        bbox = bbox_dict[row['ACTIVITY_CAT']]
+        return Point(np.random.uniform(bbox['lon_min']+OFFSET, bbox['lon_max']-OFFSET),
+            np.random.uniform(bbox['lat_min']+OFFSET, bbox['lat_max']-OFFSET))
     
+    tn_enriched.geometry = tn_enriched.apply(get_pts, axis=1)
+
     logger.info(f"   step 10/10 Save Result...")
     save_gdf_to_gdb(tn_enriched,
                     output_gdb_path,
@@ -344,11 +397,18 @@ if __name__ == "__main__":
     # Get the current process ID
     process = psutil.Process(os.getpid())
 
-    tn_input_excel_path = "b_Originals/Timber_Industry_Acres_2023_for_UCSD_20Sep2024.xlsx"
-    a_reference_gdb_path = "a_Reference.gdb"
-    start_year, end_year = 2021, 2025
-    output_gdb_path = f"/tmp/Timber_Nonspatial_{start_year}_{end_year}.gdb"
-    output_layer_name = f"Timber_Nonspatial_{datetime.today().strftime('%Y%m%d')}"
+    # load config file path yaml
+    with open("..\config.yaml", 'r') as stream:
+        config_inputs = yaml.safe_load(stream)
+
+    tn_input_excel_path = config_inputs['sources']['timber_industry_nonspatial']['input']['excel_path']
+    a_reference_gdb_path = config_inputs['global']['reference_gdb']
+    start_year, end_year = config_inputs['global']['start_year'], config_inputs['global']['end_year']
+    output_format_dict = {'start_year': start_year,
+                          'end_year': end_year,
+                          'date': datetime.today().strftime('%Y%m%d')}
+    output_gdb_path = config_inputs['sources']['timber_industry_nonspatial']['output']['gdb_path'].format(**output_format_dict)
+    output_layer_name = config_inputs['sources']['timber_industry_nonspatial']['output']['layer_name'].format(**output_format_dict)
     
     enrich_Timber_Nonspatial(tn_input_excel_path,
                              a_reference_gdb_path,
