@@ -344,6 +344,7 @@ def enrich_Timber_Nonspatial(tn_input_excel_path,
     logger.info("   step 6/10 Remove Unnecessary Columns...")
     gdf_dissolved = keep_fields(gdf_dissolved)
     show_columns(logger, gdf_dissolved, "gdf_dissolved")
+    
 
 
     
